@@ -41,10 +41,10 @@ class CountingPush:
         self.counter = counter
         self.lock = lock
 
-    def __call__(self, refspecs, leases=None):
+    def __call__(self, txn):
         with self.lock:
             self.counter[0] += 1
-        return self.orig(refspecs, leases)
+        return self.orig(txn)
 
 
 def run(mode, qs):

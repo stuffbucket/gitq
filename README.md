@@ -32,7 +32,7 @@ difference measured on a *single* clock:
 - **how long the claimer meant to hold the lease** -- `lease_until - claimed_at`,
   both stamped by the claimer, so the difference carries no skew
 - **how long this reaper has watched the claim sit unchanged** -- an interval on
-  the reaper's own clock, persisted per-reaper at `refs/jobs/reaper/<id>`
+  the reaper's own clock, persisted per-reaper at `refs/local/reaper/<id>`
 
 A claim is reclaimed only once this reaper has seen the identical claim blob for
 longer than the claimer's own declared lease. `renew()` rewrites the blob on
@@ -53,20 +53,33 @@ clock at all. Both verified under 5-minute skew.
 
 ## Safety properties, enforced not asserted
 
-- **No force pushes.** Not one. Every update is a plain refspec whose
-  `--force-with-lease` supplies both the authority to swap a blob and the
-  compare-and-swap that makes it safe. `push_atomic` rejects any refspec
-  beginning with `+`.
-- **No branch or tag is ever written.** Every push must land under
-  `refs/jobs/`; `push_atomic` refuses anything else. Point the hub at a real
-  source repo by mistake and it still cannot write `refs/heads/*`.
+Every write goes through `RefTxn`, which is the only thing in the system that
+can build one. It has three methods -- `create(ref, oid)`, `update(ref, oid,
+expect)`, `delete(ref, expect)` -- and each produces the refspec and the
+`--force-with-lease` expectation *together*. That is the point: a
+compare-and-swap is two halves that must agree, and while they were a list of
+refspecs over here and a dict of leases over there, nothing stopped a call site
+from updating a ref it never leased. Nothing hypothetical about it -- the claim
+path shipped for a while creating its `claimed` ref with no expectation at all.
+
+- **No force pushes.** Not one. `RefTxn` has no method that emits a `+`, so
+  there is no call site that could. `push_atomic` re-checks anyway, and refuses
+  any spec whose destination it does not hold a lease for.
+- **No blind overwrites.** `update` and `delete` will not accept an empty
+  expectation; a write that does not know what it is replacing cannot be
+  spelled.
+- **No branch or tag is ever written.** Every ref must sit under `refs/jobs/`.
+  `RefTxn` checks it when the ref is added, so the error names the guilty call
+  site -- and the hub checks it again in a `pre-receive` hook, which is the only
+  side an outsider does not control. Point the hub at a real source repo by
+  mistake and it still cannot write `refs/heads/*`.
 - **No commits, no merges, no history.** A job is a blob. The hub has no
   branches, so it can never conflict, never need a rebase, and `git log` on it
   is empty. Nothing to squash, nothing to reset.
 - **No `reset`, `--hard`, or `filter-branch`** anywhere in the codebase.
 
-Both guards are covered by tests, and both are verified by mutation
-(`tools/mutate.py`): removing either one makes a test fail.
+Each of these is covered by a test and verified by mutation (`tools/mutate.py`):
+removing any one of them makes a named check fail.
 
 ## Ref layout
 
@@ -77,7 +90,14 @@ refs/jobs/owner/<shard>                                   -> shard lease blob
 refs/jobs/cron/<task>/<minute:012d>                       -> per-period lock
 refs/jobs/done/<YYYYMMDD>/<key>                           -> completed
 refs/jobs/dead/<key>                                      -> attempts exhausted
+
+refs/mirror/...                                           -> local: fetched shard state
+refs/local/reaper/<id>                                    -> local: this reaper's sightings
 ```
+
+The bottom two never leave the machine that writes them. A sighting log in
+particular *cannot* usefully be shared: it records when one clock first saw a
+claim, and is meaningless against any other.
 
 A job is **one blob**. Nothing commits, so there is no history to walk and
 identical payloads collapse to the same SHA.
@@ -177,10 +197,22 @@ Each of these cost a debugging cycle and is worth knowing before you edit.
   then enqueued the job separately; a crash in between left a marker with no
   job, silently skipping that period. Anything that must happen together goes
   in one `push --atomic`.
-- **A running job must renew its lease.** The handler now runs on its own
-  thread while the poll loop heartbeats the claim. Without that, any job
+- **A running job must renew its lease.** The handler runs on its own thread
+  while `_heartbeat` renews the claim underneath it. Without that, any job
   outliving `lease_s` was reclaimed and run twice -- breaking exactly-once for
   precisely the long jobs that most depend on it.
+- **A worker holds two leases, not one.** `_execute` blocks the poll loop, so a
+  job outliving `shard_lease_s` used to let this worker's *shards* expire while
+  its job lease stayed healthy -- the worker went on working and found out only
+  on return. Both are now refreshed from the same `_heartbeat`, paced off the
+  shorter of the two.
+- **The handler thread is a daemon on purpose.** When the lease is lost the
+  handler is abandoned where it stands. A thread pool would be tidier right up
+  until `shutdown()` blocked on the future for the job we no longer own.
+- **A blob pushed to `refs/heads/*` is rejected by git anyway** ("trying to
+  write non-commit object to branch"). Testing the namespace guard with a job
+  payload therefore proves nothing; `tests/test_hub_hook.py` builds a real
+  commit so the hook is what does the rejecting.
 
 ## What this does not have
 
@@ -221,16 +253,18 @@ or [Graphile Worker](https://github.com/graphile/worker). They ship all of the a
 ## Layout
 
 ```
-gitq/git.py       git plumbing; push_atomic is the one write primitive
+gitq/git.py       git plumbing; RefTxn builds writes, push_atomic applies them
 gitq/queue.py     ref naming, job encoding, claim/complete/fail/renew
 gitq/shards.py    shard ownership leases (steal on expiry)
 gitq/reaper.py    reclaim dead workers' jobs, by observation not deadline
 gitq/cron.py      5-field cron + leaderless per-period dedup
-gitq/worker.py    the poll loop
-tests/test_gitq.py   14 assertions, real thread contention
+gitq/worker.py    the poll loop; one heartbeat for both leases
+gitq/setup_repo.py  hub + worker stores, and the hub's pre-receive hook
+tests/test_gitq.py   15 assertions, real thread contention
 tests/test_bugs.py   8 regressions: cron atomicity, lease renewal, clock skew
-tests/harness.py     shared fixtures for the three suites
-tests/test_invariants.py  13 properties mutation testing proved were unchecked
+tests/harness.py     shared fixtures for the four suites
+tests/test_invariants.py  20 properties mutation testing proved were unchecked
+tests/test_hub_hook.py    9 checks that the hub enforces its own namespace
 bench/bench.py       sharded vs unsharded
 bench/skew_probe.py  which guarantees survive a 5-minute clock skew
 tools/mutate.py      removes one guarantee at a time, checks a test notices
@@ -244,7 +278,7 @@ fix -- and reports whether any test notices. A survivor names a behaviour
 nothing is checking.
 
 ```bash
-python3 tools/mutate.py            # 18 mutations, ~9 min
+python3 tools/mutate.py            # 22 mutations, ~10 min
 python3 tools/mutate.py --only no-cas
 ```
 
@@ -263,13 +297,21 @@ Repairing those and adding `tests/test_invariants.py` brought it to **18 killed,
 `+`-overrides-the-lease bug above -- a real defect in shipped code, found
 because a mutation showed nothing was racing that path.
 
+The `RefTxn` pass made three of those mutations unrepresentable -- there is no
+longer a way to write the code they described -- so they were replaced with
+mutations against the new guarantees, plus one that disables the hub hook. The
+suite now stands at **22 killed, 0 survived**. Two of them kill by crashing
+rather than by failing a named check; that is what it looks like when a
+mutation has to forge a refspec past `RefTxn` to express the old bug at all.
+
 ## Tests
 
 ```bash
 python3 tests/test_gitq.py       # 15 passed, 0 failed
 python3 tests/test_bugs.py       #  8 passed, 0 failed
-python3 tests/test_invariants.py # 13 passed, 0 failed
-python3 tools/mutate.py          # 18 killed, 0 survived
+python3 tests/test_invariants.py # 20 passed, 0 failed
+python3 tests/test_hub_hook.py   #  9 passed, 0 failed
+python3 tools/mutate.py          # 22 killed, 0 survived
 python3 bench/bench.py 8 200
 python3 bench/skew_probe.py
 ```

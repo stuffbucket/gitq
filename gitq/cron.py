@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 
+from .git import RefTxn
 from .queue import now_or
 
 _BOUNDS = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
@@ -97,9 +98,7 @@ def tick(queue, schedules, now=None, catchup_min=10, attempted=None):
             # together or not at all. Two pushes would let a crash in between
             # leave a marker with no job, silently skipping that period forever.
             _, res = queue.git.push_atomic(
-                ["{}:{}".format(marker, ref), "{}:{}".format(job_oid, job_ref)],
-                {ref: "", job_ref: ""},
-            )
+                RefTxn().create(ref, marker).create(job_ref, job_oid))
             if res.created(ref):
                 fired.append(mark)
     return fired

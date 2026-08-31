@@ -31,9 +31,9 @@ def test_cron_period_survives_a_crash_between_marker_and_job():
         calls = []
         real = q.git.push_atomic
 
-        def spy(refspecs, leases=None):
-            calls.append(list(refspecs))
-            return real(refspecs, leases)
+        def spy(txn):
+            calls.append(txn.refs())
+            return real(txn)
         q.git.push_atomic = spy
         cron.tick(q, sched, now=now, catchup_min=0)
         q.git.push_atomic = real

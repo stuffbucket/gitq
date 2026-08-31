@@ -35,14 +35,31 @@ class Worker:
         self.stats = {"claimed": 0, "done": 0, "failed": 0, "reclaimed": 0,
                       "fired": 0, "lost": 0}
 
-    def run_once(self, now=None):
+    def _heartbeat(self, now=None, claim=None):
+        """Refresh every lease this worker's liveness rests on.
+
+        A worker holds two kinds: the shards it owns, and the job it is running.
+        Both are renewed from here so a long handler cannot starve one of them.
+        That was a real hole -- `_execute` blocks the poll loop, so a job
+        outliving shard_lease_s used to hand this worker's shards to whoever
+        noticed the expiry, and the worker discovered it only on return.
+
+        Returns whether the job claim is still ours (True when there is none).
+        """
         now = now_or(now)
-        held = sorted(self.leases.held)
         # A 60s lease renewed every 2s is 30x more often than it needs to be,
         # at one push per shard each time.
         if now - self._last_renew >= self.shard_lease_s / 3.0:
-            held = self.leases.renew(now=now)
+            self.leases.renew(now=now)
             self._last_renew = now
+        if claim is None:
+            return True
+        return self.q.renew(claim, lease_s=self.lease_s, now=now)
+
+    def run_once(self, now=None):
+        now = now_or(now)
+        self._heartbeat(now)
+        held = sorted(self.leases.held)
         if len(held) < self.shards_wanted:
             held = self.leases.acquire(want=self.shards_wanted, now=now)
 
@@ -71,6 +88,10 @@ class Worker:
         underneath it. Without that, any job outliving lease_s gets reclaimed
         by the reaper and run a second time -- which would break the
         exactly-once guarantee for exactly the long jobs that most need it.
+
+        A daemon thread, deliberately: when the lease is lost the handler is
+        abandoned where it stands. Anything that joins on it -- a thread pool,
+        say -- would block here waiting for the very job we no longer own.
         """
         handler = self.handlers.get(claim["job"]["task"])
         if handler is None:
@@ -88,12 +109,14 @@ class Worker:
 
         t = threading.Thread(target=body, daemon=True)
         t.start()
-        interval = max(1.0, self.lease_s / 3.0)
+        # Fast enough for the shorter of the two leases: heartbeating the job
+        # on its own schedule would let the shard lease lapse underneath it.
+        interval = max(1.0, min(self.lease_s, self.shard_lease_s) / 3.0)
         while True:
             t.join(interval)
             if not t.is_alive():
                 break
-            if not self.q.renew(claim, lease_s=self.lease_s):
+            if not self._heartbeat(claim=claim):
                 self.stats["lost"] += 1            # someone else owns it now
                 return
 

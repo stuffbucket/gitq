@@ -17,12 +17,15 @@ longer than the claimer's own declared lease duration. Because `renew()` writes
 a fresh blob on every heartbeat, an unchanged oid is exactly the signal that the
 worker has stopped heartbeating.
 
-Sightings persist under `refs/jobs/reaper/<id>`, namespaced per reaper so a
-reaper only ever compares its own earlier readings against its own clock.
+Sightings persist under `refs/local/reaper/<id>` in the reaper's own object
+store, and are never pushed. A log of "when did I first see this" is only
+meaningful on the clock that wrote it, so publishing it to the hub bought
+nothing and cost a push and a fetch on every sweep. The `<id>` namespacing
+remains, for two reapers sharing one store.
 """
 from __future__ import annotations
 
-from .queue import MIRROR, Q, SIGHT, now_or, safe_key
+from .queue import MIRROR, Q, now_or, safe_key
 
 DEFAULT_STALE_S = 300
 
@@ -44,22 +47,20 @@ class Reaper:
         if self._seen is not None:
             return                       # already in hand from the last sweep
         self._seen, self._prev_oid = {}, None
+        oid = self.git.read_local_ref(self.ref)
+        if not oid:
+            return
         try:
-            found = self.git.mirror_names(SIGHT, MIRROR + "/reaper", one=self.id)
-            oid = found.get(self.id)
-            if oid:
-                self._seen = self.git.read_json(oid).get("seen", {})
-                self._prev_oid = oid
+            self._seen = self.git.read_json(oid).get("seen", {})
+            self._prev_oid = oid
         except Exception:
-            pass
+            self._seen = {}              # unreadable log: start over, watch again
 
     def _save(self, seen, now):
         try:
             oid = self.git.write_json(
                 {"reaper": self.id, "updated_at": now, "seen": seen})
-            ok, _ = self.git.push_atomic(["{}:{}".format(oid, self.ref)],
-                                         {self.ref: self._prev_oid or ""})
-            if ok:
+            if self.git.write_local_ref(self.ref, oid, self._prev_oid):
                 self._seen, self._prev_oid = seen, oid
                 return
         except Exception:
