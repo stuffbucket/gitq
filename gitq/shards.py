@@ -9,6 +9,7 @@ worker's shards are simply CAS-stolen by whoever notices the expiry first.
 """
 from __future__ import annotations
 
+from .git import RefTxn
 from .queue import MIRROR, OWNER, now_or
 
 _MIRROR = MIRROR + "/owner"
@@ -63,10 +64,10 @@ class ShardLeases:
                     continue
                 expected = existing                # steal: CAS from the observed value
             ref = self.q.owner_ref(shard)
-            # No "+": the lease both authorises the non-fast-forward swap and
-            # makes it a compare-and-swap. A "+" would override the lease.
             oid = self._blob(shard, now)
-            _, res = self.git.push_atomic(["{}:{}".format(oid, ref)], {ref: expected})
+            # set(), not update(): a free shard is created, a dead worker's is
+            # stolen, and which one this is was only just decided above.
+            _, res = self.git.push_atomic(RefTxn().set(ref, oid, expected))
             if res.wrote(ref):
                 self.held[shard] = oid
         return sorted(self.held)
@@ -77,8 +78,8 @@ class ShardLeases:
         for shard in list(self.held):
             ref = self.q.owner_ref(shard)
             oid = self._blob(shard, now)
-            ok, _ = self.git.push_atomic(["{}:{}".format(oid, ref)],
-                                         {ref: self.held[shard]})
+            ok, _ = self.git.push_atomic(
+                RefTxn().update(ref, oid, self.held[shard]))
             if ok:
                 self.held[shard] = oid
             else:
@@ -88,5 +89,5 @@ class ShardLeases:
     def release(self):
         for shard, oid in list(self.held.items()):
             ref = self.q.owner_ref(shard)
-            self.git.push_atomic([":" + ref], {ref: oid})
+            self.git.push_atomic(RefTxn().delete(ref, oid))
             del self.held[shard]

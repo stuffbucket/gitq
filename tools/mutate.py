@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SUITES = ["tests/test_gitq.py", "tests/test_bugs.py",
-          "tests/test_invariants.py"]
+          "tests/test_invariants.py", "tests/test_hub_hook.py"]
 
 # (name, file, old, new, what guarantee this removes)
 MUTATIONS = [
@@ -32,10 +32,11 @@ MUTATIONS = [
      'return res.created(ref) or res.unchanged(ref)',
      "duplicate enqueue reports success"),
 
-    ("claim-no-lease", "gitq/queue.py",
-     '                "pending_oid": pending_oid, "ref": self.claimed_ref(shard, name),',
-     '                "pending_oid": "", "ref": self.claimed_ref(shard, name),',
-     "claim stops guarding the pending ref it takes"),
+    ("claim-unleased-claimed-ref", "gitq/queue.py",
+     '            txn.create(c["ref"], c["oid"])',
+     '            txn._specs.append("{}:{}".format(c["oid"], c["ref"]))',
+     "the claimed ref is written with no expectation -- now reachable only by "
+     "forging a refspec past RefTxn, which push_atomic refuses outright"),
 
     ("never-dead-letter", "gitq/queue.py",
      'if job["attempt"] >= job.get("max_attempts", 3):',
@@ -63,20 +64,27 @@ MUTATIONS = [
      "reaper reclaims even healthy, heartbeating claims"),
 
     ("worker-no-heartbeat", "gitq/worker.py",
-     "            if not self.q.renew(claim, lease_s=self.lease_s):",
+     "            if not self._heartbeat(claim=claim):",
      "            if False:",
      "long jobs stop renewing their lease"),
 
+    ("heartbeat-skips-shards", "gitq/worker.py",
+     "            self.leases.renew(now=now)",
+     "            pass",
+     "shard leases are never refreshed, so a long job loses its shards"),
+
+    ("heartbeat-ignores-shard-lease", "gitq/worker.py",
+     "        interval = max(1.0, min(self.lease_s, self.shard_lease_s) / 3.0)",
+     "        interval = max(1.0, self.lease_s / 3.0)",
+     "the heartbeat paces itself off the job lease alone, letting the shorter "
+     "shard lease lapse under a long job"),
+
     ("cron-split-push", "gitq/cron.py",
      '            _, res = queue.git.push_atomic(\n'
-     '                ["{}:{}".format(marker, ref), "{}:{}".format(job_oid, job_ref)],\n'
-     '                {ref: "", job_ref: ""},\n'
-     '            )',
-     '            _, res = queue.git.push_atomic(\n'
-     '                ["{}:{}".format(marker, ref)], {ref: ""})\n'
+     '                RefTxn().create(ref, marker).create(job_ref, job_oid))',
+     '            _, res = queue.git.push_atomic(RefTxn().create(ref, marker))\n'
      '            if res.created(ref):\n'
-     '                queue.git.push_atomic(\n'
-     '                    ["{}:{}".format(job_oid, job_ref)], {job_ref: ""})',
+     '                queue.git.push_atomic(RefTxn().create(job_ref, job_oid))',
      "cron marker and job become two separate pushes again"),
 
     ("cron-ignores-flag", "gitq/cron.py",
@@ -84,10 +92,16 @@ MUTATIONS = [
      'if not res.rejected(ref):',
      "cron losers report firing a period they did not schedule"),
 
-    ("leased-force-refspec", "gitq/shards.py",
-     '            _, res = self.git.push_atomic(["{}:{}".format(oid, ref)], {ref: expected})',
-     '            _, res = self.git.push_atomic(["+{}:{}".format(oid, ref)], {ref: expected})',
-     "a '+' silently overrides the lease, making the steal a blind overwrite"),
+    ("force-past-the-lease", "gitq/git.py",
+     '        args += ["origin", *specs]',
+     '        args += ["origin", *[s if s.startswith(":") else "+" + s for s in specs]]',
+     "a '+' reaches git downstream of the guard, overriding every lease and "
+     "turning each compare-and-swap into a blind overwrite"),
+
+    ("no-unleased-guard", "gitq/git.py",
+     '            if spec.split(":")[-1] not in leases:',
+     '            if False:',
+     "a ref can be written by a push that never stated what it expected to find"),
 
     ("no-guards", "gitq/git.py",
      '            if spec.startswith("+"):',
@@ -95,9 +109,14 @@ MUTATIONS = [
      "force refspecs stop being rejected"),
 
     ("no-namespace-guard", "gitq/git.py",
-     '            if not spec.split(":")[-1].startswith(NAMESPACE):',
-     '            if False:',
-     "pushes may leave refs/jobs/ and write branches"),
+     '        if not ref.startswith(NAMESPACE):',
+     '        if False:',
+     "transactions may leave refs/jobs/ and write branches"),
+
+    ("hub-accepts-anything", "gitq/setup_repo.py",
+     '    _install_hook(path)',
+     '    pass',
+     "the hub stops enforcing its namespace, leaving only the client assertion"),
 
     ("no-dot-collapse", "gitq/queue.py",
      '    k = re.sub(r"\\.{2,}", ".", k)      # \'..\' is illegal in a ref name',

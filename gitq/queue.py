@@ -13,14 +13,16 @@ import hashlib
 import re
 import time
 
-from .git import Git
+from .git import RefTxn
 
 Q = "refs/jobs/q"
 DONE = "refs/jobs/done"
 DEAD = "refs/jobs/dead"
 OWNER = "refs/jobs/owner"
 CRON = "refs/jobs/cron"
-SIGHT = "refs/jobs/reaper"
+# Never pushed: a sighting log is only meaningful on the clock that wrote it,
+# so it lives in the reaper's own store. See reaper.py.
+SIGHT = "refs/local/reaper"
 MIRROR = "refs/mirror"
 
 # Single source of truth for the globs the CLI and tests use to inspect state.
@@ -114,22 +116,21 @@ class Queue:
         so a duplicate enqueue is a no-op rather than a second job.
         """
         ref, oid = self.prepare(task, args, key, due, prio, max_attempts)
-        _, res = self.git.push_atomic(["{}:{}".format(oid, ref)], {ref: ""})
+        _, res = self.git.push_atomic(RefTxn().create(ref, oid))
         return res.created(ref)
 
     def enqueue_batch(self, jobs):
         """One atomic push for many jobs. ~2.5x cheaper per job than one at a time."""
-        refspecs, leases = [], {}
+        txn = RefTxn()
         for j in jobs:
             ref, oid = self.prepare(j["task"], j.get("args"), j.get("key"),
                                     j.get("due"), j.get("prio", 50),
                                     j.get("max_attempts", 3))
-            refspecs.append("{}:{}".format(oid, ref))
-            leases[ref] = ""
-        if not refspecs:
-            return 0
-        ok, res = self.git.push_atomic(refspecs, leases)
-        return sum(1 for r in leases if res.created(r)) if ok else 0
+            if ref in txn.refs():
+                continue      # same job twice in one batch is one job, not an error
+            txn.create(ref, oid)
+        ok, res = self.git.push_atomic(txn)
+        return sum(1 for r in txn.refs() if res.created(r)) if ok else 0
 
     # -- claim --------------------------------------------------------------
     def poll(self, shard, now=None):
@@ -157,6 +158,18 @@ class Queue:
                 "pending_oid": pending_oid, "ref": self.claimed_ref(shard, name),
                 "oid": claim_oid, "job": claim}
 
+    def _claim_txn(self, staged):
+        """The pending->claimed move for one or more jobs, as one transaction.
+
+        Releasing the pending ref and taking the claimed one are the same event;
+        splitting them would leak a job or run it twice.
+        """
+        txn = RefTxn()
+        for c in staged:
+            txn.delete(c["pending"], c["pending_oid"])
+            txn.create(c["ref"], c["oid"])
+        return txn
+
     def claim_batch(self, shard, worker, limit=10, lease_s=300, now=None):
         """Atomically move up to `limit` pending jobs to claimed. Exactly-once.
 
@@ -168,17 +181,13 @@ class Queue:
                   for name, oid in self.poll(shard, now)[:limit]]
         if not staged:
             return []
-        ok, _ = self.git.push_atomic(
-            [s for c in staged
-             for s in (":" + c["pending"], "{}:{}".format(c["oid"], c["ref"]))],
-            {c["pending"]: c["pending_oid"] for c in staged})
+        ok, _ = self.git.push_atomic(self._claim_txn(staged))
         if ok:
             return staged
         # Lost the batch. Retry one at a time so partial progress is still
         # possible when only some refs were taken by someone else.
-        return [c for c in staged if self.git.push_atomic(
-            [":" + c["pending"], "{}:{}".format(c["oid"], c["ref"])],
-            {c["pending"]: c["pending_oid"]})[0]]
+        return [c for c in staged
+                if self.git.push_atomic(self._claim_txn([c]))[0]]
 
     # -- terminal transitions ----------------------------------------------
     def _move(self, claim, oid, dst):
@@ -188,8 +197,7 @@ class Queue:
         is created only if absent -- the shape every terminal transition needs.
         """
         ok, _ = self.git.push_atomic(
-            [":" + claim["ref"], "{}:{}".format(oid, dst)],
-            {claim["ref"]: claim["oid"], dst: ""})
+            RefTxn().delete(claim["ref"], claim["oid"]).create(dst, oid))
         return ok
 
     def complete(self, claim, now=None):
@@ -223,7 +231,7 @@ class Queue:
         job = dict(claim["job"], lease_until=now + lease_s)
         oid = self.git.write_json(job)
         ok, _ = self.git.push_atomic(
-            ["{}:{}".format(oid, claim["ref"])], {claim["ref"]: claim["oid"]})
+            RefTxn().update(claim["ref"], oid, claim["oid"]))
         if ok:
             claim["oid"], claim["job"] = oid, job
         return ok

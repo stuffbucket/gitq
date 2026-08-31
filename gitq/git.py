@@ -9,10 +9,16 @@ from __future__ import annotations
 import json
 import subprocess
 
-# Every push this library makes must land inside this namespace. Enforced in
-# push_atomic so a misconfigured hub -- one pointed at a real source repo --
-# cannot be made to write a branch, rather than merely not doing so today.
+# Every ref this library writes must live inside this namespace. Enforced in
+# RefTxn so a misconfigured hub -- one pointed at a real source repo -- cannot
+# be made to write a branch, rather than merely not doing so today. The hub
+# enforces it again on its own side; this half is an assertion, that half is
+# the actual boundary.
 NAMESPACE = "refs/jobs/"
+
+# The lease value meaning "this ref must not exist". git spells it as an empty
+# --force-with-lease expectation; naming it keeps that spelling in one place.
+ABSENT = ""
 
 
 class GitError(RuntimeError):
@@ -26,6 +32,77 @@ def run_git(*args, stdin=None, check=True):
     if check and p.returncode != 0:
         raise GitError("git {}\n{}".format(" ".join(args), p.stderr.strip()))
     return p
+
+
+class RefTxn:
+    """One all-or-nothing ref update, expressed only as compare-and-swaps.
+
+    Every write in this system is a CAS, and a CAS is two halves that have to
+    agree: the refspec naming the new value, and the lease naming the value it
+    is allowed to replace. Held apart -- a list of refspecs here, a dict of
+    leases there -- nothing stops a call site from updating a ref it never
+    leased, which is a blind overwrite wearing the syntax of a compare-and-swap.
+    That is not hypothetical: the claim path shipped for a while creating its
+    `claimed` ref with no expectation at all.
+
+    Here the two halves cannot be produced separately. Every method demands the
+    value it expects to find, so `push_atomic` can assert something structural:
+    each ref touched carries a lease, or the transaction does not exist.
+    """
+
+    __slots__ = ("_specs", "_leases")
+
+    def __init__(self):
+        self._specs = []
+        self._leases = {}
+
+    def _add(self, ref, spec, expect):
+        if not ref.startswith(NAMESPACE):
+            raise GitError(
+                "refusing to touch a ref outside {}: {!r}".format(NAMESPACE, ref))
+        if ref in self._leases:
+            # git rejects the whole push for this ("multiple updates for ref"),
+            # so catching it here just moves the error to the guilty call site.
+            raise GitError("two updates for {} in one transaction".format(ref))
+        self._specs.append(spec)
+        self._leases[ref] = expect
+        return self
+
+    def create(self, ref, oid):
+        """Write a ref that must not already exist -- the idempotency primitive."""
+        return self._add(ref, "{}:{}".format(oid, ref), ABSENT)
+
+    def update(self, ref, oid, expect):
+        """Replace a ref's value, from the exact value we observed it holding."""
+        if not expect:
+            raise GitError(
+                "update of {} needs the value it replaces; use create()".format(ref))
+        return self._add(ref, "{}:{}".format(oid, ref), expect)
+
+    def delete(self, ref, expect):
+        """Remove a ref we still hold. An unconditional delete is not offered:
+        it would drop a job someone else had already taken."""
+        if not expect:
+            raise GitError("delete of {} needs the value it removes".format(ref))
+        return self._add(ref, ":" + ref, expect)
+
+    def set(self, ref, oid, expect):
+        """create() or update(), for callers whose expectation is data --
+        a shard lease is taken from absence or stolen from a value, and which
+        one is not known until the owner ref has been read."""
+        return self.create(ref, oid) if not expect else self.update(ref, oid, expect)
+
+    def specs(self):
+        return list(self._specs)
+
+    def leases(self):
+        return dict(self._leases)
+
+    def refs(self):
+        return list(self._leases)
+
+    def __len__(self):
+        return len(self._specs)
 
 
 class PushResult:
@@ -110,6 +187,21 @@ class Git:
                 refs[name] = oid
         return refs
 
+    def read_local_ref(self, ref):
+        """Value of a ref in this store, or None. For refs that never leave it."""
+        p = self.run("rev-parse", "--verify", "--quiet", ref, check=False)
+        return p.stdout.strip() or None
+
+    def write_local_ref(self, ref, oid, expect):
+        """Compare-and-swap a ref in this store only, never pushed.
+
+        Not a RefTxn: nothing here is shared, so there is no transaction to be
+        atomic across and no namespace to stay inside. Still a CAS, because two
+        processes can share one object store.
+        """
+        return self.run("update-ref", ref, oid, expect or "",
+                        check=False).returncode == 0
+
     def mirror(self, src_prefix, dst_prefix, one=None):
         """Fetch a remote ref subtree into a local namespace, pruning what is
         gone. `one` fetches a single ref instead of the whole subtree.
@@ -132,32 +224,33 @@ class Git:
                 for ref, oid in self.local_refs(dst_prefix).items()}
 
     # -- the one write primitive --------------------------------------------
-    def push_atomic(self, refspecs, leases=None):
-        """All-or-nothing multi-ref update, guarded by compare-and-swap.
+    def push_atomic(self, txn):
+        """Apply a RefTxn against origin: all of it lands, or none of it does.
 
-        leases maps refname -> expected oid ("" means must-not-exist). Returns
-        (ok, PushResult). A False result means someone else won the race, which
-        is an ordinary outcome here, not an error.
+        Returns (ok, PushResult). A False result means someone else won the
+        race, which is an ordinary outcome here, not an error.
         """
-        leases = leases or {}
-        for spec in refspecs:
+        if not isinstance(txn, RefTxn):
+            raise GitError("push_atomic takes a RefTxn, not {}".format(type(txn).__name__))
+        specs, leases = txn.specs(), txn.leases()
+        if not specs:
+            return True, PushResult(True, {})
+
+        # The last point before the bytes reach git. RefTxn cannot construct a
+        # spec that trips either check -- they are here to catch a bug in
+        # RefTxn, not a careless caller, so they must stay cheap and total.
+        for spec in specs:
             if spec.startswith("+"):
                 # A "+" silently overrides --force-with-lease, turning every
                 # compare-and-swap into a blind overwrite. Measured: 10 racers
                 # against one ref yielded ~6 winners with "+", exactly 1 without.
-                # The lease alone already authorises a non-fast-forward swap.
                 raise GitError("refusing a force refspec: {!r}".format(spec))
-            if not spec.split(":")[-1].startswith(NAMESPACE):
-                raise GitError(
-                    "refusing to push outside {}: {!r}".format(NAMESPACE, spec))
-        for ref in leases:
-            if not ref.startswith(NAMESPACE):
-                raise GitError(
-                    "refusing to lease outside {}: {!r}".format(NAMESPACE, ref))
+            if spec.split(":")[-1] not in leases:
+                raise GitError("unleased ref in transaction: {!r}".format(spec))
 
         args = ["push", "--atomic", "--porcelain"]
         args += ["--force-with-lease={}:{}".format(r, o) for r, o in leases.items()]
-        args += ["origin", *refspecs]
+        args += ["origin", *specs]
         p = self.run(*args, check=False)
         flags = {}
         for line in p.stdout.splitlines():

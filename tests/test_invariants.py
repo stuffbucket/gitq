@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from harness import (SKEW, check, claim_all, cleanup, collect, lab,  # noqa: E402,F401
                      main, parallel)
-from gitq import ShardLeases  # noqa: E402
+from gitq import RefTxn, ShardLeases, Worker  # noqa: E402
 from gitq.git import GitError  # noqa: E402
 from gitq.queue import shard_of  # noqa: E402
 
@@ -79,42 +79,117 @@ def test_ref_unsafe_keys_are_sanitized():
         cleanup(d)
 
 
-def test_push_refuses_to_leave_the_jobs_namespace():
-    """Structural guarantee that this library cannot write a branch, in the
-    hub or anywhere else, even if pointed at a source repo."""
+def test_a_transaction_cannot_leave_the_jobs_namespace():
+    """Structural guarantee that this library cannot write a branch, in the hub
+    or anywhere else, even if pointed at a source repo. Checked when the ref is
+    added, so the error names the guilty call site rather than the push."""
     d, (q,) = lab()
     try:
         oid = q.git.write_blob("x")
-        for spec in ("{}:refs/heads/main".format(oid),
-                     "+{}:refs/heads/main".format(oid),
-                     ":refs/heads/main",
-                     "{}:refs/tags/v1".format(oid)):
+        for label, build in (
+                ("create a branch", lambda t: t.create("refs/heads/main", oid)),
+                ("update a branch", lambda t: t.update("refs/heads/main", oid, oid)),
+                ("delete a branch", lambda t: t.delete("refs/heads/main", oid)),
+                ("create a tag", lambda t: t.create("refs/tags/v1", oid))):
             try:
-                q.git.push_atomic([spec])
-                check("refuses {}".format(spec[-16:]), False, "push was allowed")
+                build(RefTxn())
+                check("refuses to {}".format(label), False, "it was allowed")
             except GitError as e:
-                # Either guard is a correct refusal: force refspecs are rejected
-                # before the namespace is even considered.
-                check("refuses {}".format(spec[:1] + spec[-16:]),
-                      "refusing to push outside" in str(e)
-                      or "refusing a force refspec" in str(e), str(e))
-        # A force refspec must be refused even when its target is legitimate --
-        # the namespace guard would wave this one through.
+                check("refuses to {}".format(label),
+                      "outside refs/jobs/" in str(e), str(e))
+    finally:
+        cleanup(d)
+
+
+def test_no_write_can_omit_the_value_it_replaces():
+    """The blind overwrite has no spelling. Every method that changes an
+    existing ref demands the value it expects to find, which is what makes
+    "compare-and-swap" a property of the type rather than of each call site."""
+    d, (q,) = lab()
+    try:
+        oid = q.git.write_blob("x")
+        job = "refs/jobs/q/s00/pending/000000000001-50-x"
+        for label, build in (
+                ("update", lambda t: t.update(job, oid, "")),
+                ("delete", lambda t: t.delete(job, ""))):
+            try:
+                build(RefTxn())
+                check("{} demands an expectation".format(label), False,
+                      "an unguarded {} was allowed".format(label))
+            except GitError as e:
+                check("{} demands an expectation".format(label),
+                      "needs the value" in str(e), str(e))
         try:
-            q.git.push_atomic(["+{}:refs/jobs/q/s00/pending/x".format(oid)])
-            check("refuses a force refspec inside the namespace", False,
-                  "force push was allowed")
+            RefTxn().create(job, oid).create(job, oid)
+            check("one ref cannot be written twice in a transaction", False,
+                  "duplicate was allowed")
         except GitError as e:
-            check("refuses a force refspec inside the namespace",
-                  "refusing a force refspec" in str(e), str(e))
+            check("one ref cannot be written twice in a transaction",
+                  "two updates" in str(e), str(e))
+    finally:
+        cleanup(d)
+
+
+def test_every_ref_in_a_push_carries_a_lease():
+    """push_atomic's last-line checks, which exist to catch a bug in RefTxn
+    rather than a careless caller. Reaching them means forging a refspec --
+    exactly what such a bug would do -- so that is how they are tested."""
+    d, (q,) = lab()
+    try:
+        oid = q.git.write_blob("x")
+        forged = "refs/jobs/q/s00/pending/000000000001-50-forged"
+
+        unleased = RefTxn().create(
+            "refs/jobs/q/s00/pending/000000000002-50-ok", oid)
+        unleased._specs.append("{}:{}".format(oid, forged))
+        try:
+            q.git.push_atomic(unleased)
+            check("an unleased ref cannot reach git", False, "push was allowed")
+        except GitError as e:
+            check("an unleased ref cannot reach git", "unleased" in str(e), str(e))
+
+        forced = RefTxn().create(forged, oid)
+        forced._specs[0] = "+" + forced._specs[0]
+        try:
+            q.git.push_atomic(forced)
+            check("a force refspec cannot reach git", False, "push was allowed")
+        except GitError as e:
+            check("a force refspec cannot reach git",
+                  "force refspec" in str(e), str(e))
 
         try:
-            q.git.push_atomic(["{}:refs/jobs/q/s00/pending/x".format(oid)],
-                              {"refs/heads/main": ""})
-            check("refuses a lease outside the namespace", False, "lease was allowed")
+            q.git.push_atomic(["{}:{}".format(oid, forged)])
+            check("a bare refspec list is not a transaction", False,
+                  "the pre-RefTxn calling convention still works")
         except GitError as e:
-            check("refuses a lease outside the namespace",
-                  "refusing to lease outside" in str(e), str(e))
+            check("a bare refspec list is not a transaction",
+                  "takes a RefTxn" in str(e), str(e))
+
+        check("no forged push landed", not q.refs("pending"),
+              "hub holds {}".format(sorted(q.refs("pending"))))
+    finally:
+        cleanup(d)
+
+
+def test_a_long_job_keeps_its_shard_lease_alive():
+    """_execute blocks the poll loop, so the shard lease has to be renewed from
+    inside it. Otherwise a job outliving shard_lease_s silently hands this
+    worker's shards to whoever notices the expiry first."""
+    d, (q,) = lab(1, nshards=1)
+    try:
+        q.enqueue("slow", key="j1", due=1)
+        w = Worker(q, "w0", {"slow": lambda args: time.sleep(3)},
+                   shard_lease_s=1, lease_s=60, poll_s=0.1)
+        start = time.time()
+        w.leases.acquire(want=1, now=start)
+        w._last_renew = start        # so the poll loop's own renewal is a no-op
+        before = dict(w.leases.held)
+        w.run_once(now=start)
+        check("the job ran", w.stats["done"] == 1,
+              "stats={}".format(w.stats))
+        check("shard lease was renewed while the job ran",
+              bool(w.leases.held) and w.leases.held != before,
+              "held {} before, {} after".format(before, w.leases.held))
     finally:
         cleanup(d)
 
@@ -158,13 +233,12 @@ def test_multi_ref_push_is_all_or_nothing():
         old, new = q.git.write_blob("x"), q.git.write_blob("y")
         taken = "refs/jobs/q/s00/pending/000000000001-50-taken"
         fresh = "refs/jobs/q/s00/pending/000000000002-50-fresh"
-        q.git.push_atomic(["{}:{}".format(old, taken)], {taken: ""})
+        q.git.push_atomic(RefTxn().create(taken, old))
 
         # `taken` exists at `old`, so its must-not-exist lease fails. `fresh`
         # would succeed on its own and must be rolled back with it.
         ok, _ = q.git.push_atomic(
-            ["{}:{}".format(new, fresh), "{}:{}".format(new, taken)],
-            {fresh: "", taken: ""})
+            RefTxn().create(fresh, new).create(taken, new))
         landed = q.refs("pending")
         check("a push with one failing ref applies none of them",
               not ok and fresh not in landed,
