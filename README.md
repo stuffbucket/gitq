@@ -225,6 +225,39 @@ Each of these cost a debugging cycle and is worth knowing before you edit.
   payload therefore proves nothing; `tests/test_hub_hook.py` builds a real
   commit so the hook is what does the rejecting.
 
+## Cost of a poll
+
+Every git operation is a process, and on the numbers below a fork costs about a
+thousand times more than the work it wraps -- reading a job payload takes ~3us
+inside a `cat-file` that takes ~9ms to start. So the unit that matters is not
+milliseconds, it is *how many processes a poll costs*.
+
+| operation | processes before | after |
+|---|---|---|
+| worker poll + claim, 100 jobs over 16 shards | 248 | **65** |
+| reaper sweep, 100 claims | 135 | **36** |
+
+Three changes, all of them "do the same work in one process instead of N":
+
+- `cat-file --batch` reads every payload at once. A 100-claim sweep went from
+  ~944ms of forking to ~10ms of reading.
+- `hash-object --stdin-paths` writes every claim at once.
+- one `fetch` carries every held shard's refspec. A fetch costs ~26ms of
+  connection and ref advertisement whether it carries one refspec or sixteen,
+  so sixteen shards cost ~412ms separately and ~28ms together.
+
+The last one is only safe because `--prune` stays scoped to the destinations of
+the refspecs actually passed, so it prunes exactly what the per-shard loop
+pruned. That was verified against partial deletion, a fully emptied shard and
+orphaned local refs before it was relied on, and there is a test for it. The
+corollary is a real constraint on callers: **pass every shard whose mirror
+should be current**, because one left out is one that silently goes stale.
+
+Not done: resolving `git` to an absolute path. On macOS `["git", ...]` finds
+the `xcrun` shim, which costs ~5.8ms per call over the real binary -- a large
+win, and an entirely macOS-specific one. Not worth platform-specific tuning in
+a library whose portability is the thing CI checks.
+
 ## What this does not have
 
 Deliberate omissions, and the reason to reach for Postgres instead:
@@ -274,7 +307,7 @@ gitq/setup_repo.py  hub + worker stores, and the hub's pre-receive hook
 tests/test_gitq.py   15 assertions, real thread contention
 tests/test_bugs.py   8 regressions: cron atomicity, lease renewal, clock skew
 tests/harness.py     shared fixtures for the four suites
-tests/test_invariants.py  23 properties mutation testing proved were unchecked
+tests/test_invariants.py  28 properties mutation testing proved were unchecked
 tests/test_hub_hook.py    9 checks that the hub enforces its own namespace
 bench/bench.py       sharded vs unsharded
 bench/skew_probe.py  which guarantees survive a 5-minute clock skew
@@ -291,7 +324,7 @@ fix -- and reports whether any test notices. A survivor names a behaviour
 nothing is checking.
 
 ```bash
-python3 tools/mutate.py            # 24 mutations, ~11 min
+python3 tools/mutate.py            # 26 mutations, ~12 min
 python3 tools/mutate.py --only no-cas
 ```
 
@@ -322,9 +355,9 @@ mutation has to forge a refspec past `RefTxn` to express the old bug at all.
 ```bash
 python3 tests/test_gitq.py       # 15 passed, 0 failed
 python3 tests/test_bugs.py       #  8 passed, 0 failed
-python3 tests/test_invariants.py # 23 passed, 0 failed
+python3 tests/test_invariants.py # 28 passed, 0 failed
 python3 tests/test_hub_hook.py   #  9 passed, 0 failed
-python3 tools/mutate.py          # 24 killed, 0 survived
+python3 tools/mutate.py          # 26 killed, 0 survived
 python3 bench/bench.py 8 200
 python3 bench/skew_probe.py
 ```
@@ -349,7 +382,7 @@ docker run --rm gitq-test                          # all four suites
 docker run --rm gitq-test python3 tools/mutate.py  # the full sweep, ~10 min
 ```
 
-Verified on Alpine, git 2.54.0, Python 3.13, musl: 55 checks, 0 failed.
+Verified on Alpine, git 2.54.0, Python 3.13, musl: 60 checks, 0 failed.
 
 CI runs exactly that image on every pull request, and the mutation sweep
 weekly -- it is too slow per-commit, and "a test stopped testing anything" is

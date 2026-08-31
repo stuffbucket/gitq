@@ -74,9 +74,13 @@ class Worker:
             self._last_reap = now
 
         worked = 0
+        # Mirror every held shard in one fetch, then claim from what came back.
+        # Per-shard polling paid a fetch's fixed cost once per shard.
+        polled = self.q.poll_many(held, now=now) if held else {}
         for shard in held:
             for claim in self.q.claim_batch(shard, self.name, limit=self.batch,
-                                            lease_s=self.lease_s, now=now):
+                                            lease_s=self.lease_s, now=now,
+                                            due=polled[shard]):
                 self.stats["claimed"] += 1
                 worked += 1
                 self._execute(claim)

@@ -123,6 +123,18 @@ MUTATIONS = [
      '    pass',
      "'..' survives into ref names, which git rejects"),
 
+    ("batch-read-ignores-missing", "gitq/git.py",
+     '            if header[-1] in (b"missing", b"ambiguous"):',
+     "            if False:",
+     "a missing object stops being skipped, mis-framing every object after it"),
+
+    ("combined-fetch-no-prune", "gitq/git.py",
+     '        self.run("fetch", "--prune", "--quiet", "--no-tags",\n'
+     '                 "--no-write-fetch-head", "origin", *specs)',
+     '        self.run("fetch", "--quiet", "--no-tags",\n'
+     '                 "--no-write-fetch-head", "origin", *specs)',
+     "combined mirroring stops pruning, so claimed jobs linger as pending"),
+
     ("poll-dies-on-fetch-error", "gitq/queue.py",
      "        except GitError:",
      "        except ZeroDivisionError:",

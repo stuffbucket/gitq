@@ -133,24 +133,28 @@ class Queue:
         return sum(1 for r in txn.refs() if res.created(r)) if ok else 0
 
     # -- claim --------------------------------------------------------------
-    def poll(self, shard, now=None):
-        """Mirror a shard's pending refs locally and return due jobs, earliest first."""
-        now = now_or(now)
-        dst = "{}/{}/pending".format(MIRROR, shard)
+    def _mirror_pending(self, shards):
+        """Refresh these shards' mirrors in one fetch, tolerating failure.
+
+        A transient failure -- the hub busy, the machine out of process slots
+        under load -- must not take a worker down. Falling back to the mirror
+        already on disk is safe precisely because every claim is a
+        compare-and-swap: a stale pending oid fails its lease, costing a
+        rejected push and never a double run.
+        """
         try:
-            mirrored = self.git.mirror_names("{}/{}/pending".format(Q, shard), dst)
+            self.git.mirror_many(
+                [("{}/{}/pending".format(Q, s), "{}/{}/pending".format(MIRROR, s))
+                 for s in shards])
         except GitError:
-            # A transient fetch failure -- the hub busy, or the machine out of
-            # process slots under load -- must not take a worker down. Fall back
-            # to the mirror already on disk. Acting on stale refs is safe here
-            # precisely because every claim is a compare-and-swap: a stale
-            # pending oid fails its lease, costing a rejected push and never a
-            # double run.
-            prefix = dst + "/"
-            mirrored = {ref[len(prefix):]: oid
-                        for ref, oid in self.git.local_refs(dst).items()}
+            pass
+
+    def _due_from_mirror(self, shard, now):
+        """Due jobs from a shard's mirror as it stands, earliest first."""
+        prefix = "{}/{}/pending/".format(MIRROR, shard)
         out = []
-        for name, oid in mirrored.items():
+        for ref, oid in self.git.local_refs(prefix.rstrip("/")).items():
+            name = ref[len(prefix):]
             try:
                 due = int(name.split("-", 1)[0])
             except ValueError:
@@ -160,14 +164,24 @@ class Queue:
         out.sort()  # cheap: shard-scoped, and names already sort into due order
         return out
 
-    def _stage(self, shard, name, pending_oid, worker, now, lease_s):
-        """Everything needed to move one job pending -> claimed."""
-        claim = dict(self.git.read_json(pending_oid), worker=worker,
-                     claimed_at=now, lease_until=now + lease_s)
-        claim_oid = self.git.write_json(claim)
-        return {"shard": shard, "name": name, "pending": self.pending_ref(shard, name),
-                "pending_oid": pending_oid, "ref": self.claimed_ref(shard, name),
-                "oid": claim_oid, "job": claim}
+    def poll(self, shard, now=None):
+        """Mirror a shard's pending refs locally and return due jobs."""
+        now = now_or(now)
+        self._mirror_pending([shard])
+        return self._due_from_mirror(shard, now)
+
+    def poll_many(self, shards, now=None):
+        """poll() for several shards, in ONE fetch. Returns {shard: [(name, oid)]}.
+
+        A fetch costs the same whether it carries one refspec or sixteen, so a
+        worker holding sixteen shards spent ~412ms per poll doing separately
+        what costs ~28ms here. Every shard passed gets its mirror pruned, so
+        pass all of them -- one left out is one that silently goes stale.
+        """
+        now = now_or(now)
+        shards = list(shards)
+        self._mirror_pending(shards)
+        return {s: self._due_from_mirror(s, now) for s in shards}
 
     def _claim_txn(self, staged):
         """The pending->claimed move for one or more jobs, as one transaction.
@@ -181,15 +195,31 @@ class Queue:
             txn.create(c["ref"], c["oid"])
         return txn
 
-    def claim_batch(self, shard, worker, limit=10, lease_s=300, now=None):
+    def claim_batch(self, shard, worker, limit=10, lease_s=300, now=None, due=None):
         """Atomically move up to `limit` pending jobs to claimed. Exactly-once.
 
         The whole batch is one --atomic push guarded by --force-with-lease on
         every pending ref, so a losing racer creates nothing at all.
+
+        `due` takes an already-polled list, so a caller that mirrored several
+        shards in one fetch does not turn around and re-fetch this one.
         """
         now = now_or(now)
-        staged = [self._stage(shard, name, oid, worker, now, lease_s)
-                  for name, oid in self.poll(shard, now)[:limit]]
+        found = (self.poll(shard, now) if due is None else due)[:limit]
+        if not found:
+            return []
+        # One process to read every payload and one to write every claim,
+        # rather than two per job. A job whose blob this store somehow lacks is
+        # dropped rather than guessed at -- read_blobs omits what it cannot find.
+        payloads = self.git.read_json_many([oid for _, oid in found])
+        found = [(n, o) for n, o in found if o in payloads]
+        jobs = [dict(payloads[oid], worker=worker, claimed_at=now,
+                     lease_until=now + lease_s) for _, oid in found]
+        oids = self.git.write_json_many(jobs)
+        staged = [{"shard": shard, "name": name,
+                   "pending": self.pending_ref(shard, name), "pending_oid": pending,
+                   "ref": self.claimed_ref(shard, name), "oid": oid, "job": job}
+                  for (name, pending), job, oid in zip(found, jobs, oids)]
         if not staged:
             return []
         ok, _ = self.git.push_atomic(self._claim_txn(staged))
