@@ -1,0 +1,8 @@
+# Queue runtime state: the hub repo and per-worker object stores.
+# Regenerate with `./gitq-cli init`.
+.gitq/
+
+__pycache__/
+*.pyc
+.DS_Store
+.claude
