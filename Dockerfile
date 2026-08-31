@@ -1,7 +1,7 @@
 # Linux test environment. Everything here is stdlib Python; the only real
 # dependency is a git new enough for reftable, which is what the storage
 # design rests on. Pinned by digest-free tag so dependabot can bump it.
-FROM python:3.13-alpine
+FROM python:3.14-alpine
 
 RUN apk add --no-cache git
 
