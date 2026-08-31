@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "37 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      # Tests run in the image rather than on the runner: the storage design
+      # needs a git with reftable, and pinning that in the Dockerfile is the
+      # only way the local and CI environments are the same environment.
+      - run: docker build -t gitq-test .
+      - run: docker run --rm gitq-test
+
+  mutation:
+    # ~10 minutes -- every mutation reruns every suite. Its job is catching
+    # tests that have quietly stopped testing anything, which is a weekly
+    # problem, not a per-commit one.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t gitq-test .
+      - run: docker run --rm gitq-test python3 tools/mutate.py

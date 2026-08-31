@@ -268,6 +268,8 @@ tests/test_hub_hook.py    9 checks that the hub enforces its own namespace
 bench/bench.py       sharded vs unsharded
 bench/skew_probe.py  which guarantees survive a 5-minute clock skew
 tools/mutate.py      removes one guarantee at a time, checks a test notices
+tools/run_tests.py   runs all four suites, one process each, one verdict
+Dockerfile           the Linux test environment; pins a git that has reftable
 ```
 
 ## Mutation testing
@@ -316,6 +318,32 @@ python3 bench/bench.py 8 200
 python3 bench/skew_probe.py
 ```
 
+Or all four suites at once, with one verdict:
+
+```bash
+python3 tools/run_tests.py
+```
+
+### On Linux
+
+Development here happens on macOS; CI and the Dockerfile are the check that
+nothing has quietly become macOS-specific. The image exists mostly to pin a
+git new enough for `reftable` -- `--ref-format=reftable` landed in 2.45, and
+distro gits are often older. The build fails outright if the base image ever
+drifts below that, rather than halfway through a suite.
+
+```bash
+docker build -t gitq-test .
+docker run --rm gitq-test                          # all four suites
+docker run --rm gitq-test python3 tools/mutate.py  # the full sweep, ~10 min
+```
+
+Verified on Alpine, git 2.54.0, Python 3.13, musl: 52 checks, 0 failed.
+
+CI runs exactly that image on every pull request, and the mutation sweep
+weekly -- it is too slow per-commit, and "a test stopped testing anything" is
+not a per-commit problem.
+
 ## Repo identity
 
 This lives under `~/github/stuffbucket/`, so `~/.gitconfig`'s conditional
@@ -347,3 +375,7 @@ default.
 
 Identity comes from `~/.gitconfig`'s conditional include for
 `~/github/stuffbucket/`; there is deliberately no local `user.*` here.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
