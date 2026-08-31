@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Tests run in the image rather than on the runner: the storage design
       # needs a git with reftable, and pinning that in the Dockerfile is the
       # only way the local and CI environments are the same environment.
@@ -31,6 +31,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: docker build -t gitq-test .
       - run: docker run --rm gitq-test python3 tools/mutate.py
