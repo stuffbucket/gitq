@@ -345,10 +345,22 @@ because a mutation showed nothing was racing that path.
 
 The `RefTxn` pass made three of those mutations unrepresentable -- there is no
 longer a way to write the code they described -- so they were replaced with
-mutations against the new guarantees, plus one that disables the hub hook. The
-suite now stands at **22 killed, 0 survived**. Two of them kill by crashing
-rather than by failing a named check; that is what it looks like when a
-mutation has to forge a refspec past `RefTxn` to express the old bug at all.
+mutations against the new guarantees, plus one that disables the hub hook, two
+for surviving transient git failures, and two for the batch object and fetch
+paths. The suite now stands at **26 killed, 0 survived**.
+
+Twenty-four of those kill by failing a named check. Two kill by crashing the
+suite instead -- `claim-unleased-claimed-ref`, which has to forge a refspec
+past `RefTxn` to express the old bug at all and is refused outright when it
+does, and `safe-key-nosanitize`, where git rejects the malformed ref name
+before any assertion is reached. A crash is a weaker signal than a named
+failure, so it is worth knowing which is which.
+
+Run it on a machine with disk headroom. The sweep restores each file after
+mutating it, and if that write fails -- a full disk, most plausibly -- every
+remaining mutation "passes" instantly against a broken tree and the run reports
+kills it did not earn. It says `RESTORE FAILED` when this happens. Believe it;
+that line invalidates the whole run, including the total.
 
 ## Tests
 
