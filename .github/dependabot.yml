@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # gitq itself is stdlib-only, so there is no package manifest to scan. The
+  # two things it does depend on are the test image's base and the actions
+  # that run CI -- both third-party, both pinned, both worth watching.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+      time: "06:23"
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+      time: "06:23"
+    commit-message:
+      prefix: ci

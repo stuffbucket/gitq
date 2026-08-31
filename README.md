@@ -209,6 +209,17 @@ Each of these cost a debugging cycle and is worth knowing before you edit.
 - **The handler thread is a daemon on purpose.** When the lease is lost the
   handler is abandoned where it stands. A thread pool would be tidier right up
   until `shutdown()` blocked on the future for the job we no longer own.
+- **A worker must survive a failed git command.** Not every failure is about
+  this queue: the hub can be momentarily busy, and a machine under load can
+  simply run out of process slots (`cannot fork() for git-upload-pack`). Dying
+  on the first one and never coming back is worse than any of them. `poll`
+  degrades to the mirror already on disk -- safe precisely because a claim is a
+  compare-and-swap, so a stale oid costs a rejected push and never a double run.
+- **A dropped tally looks exactly like a lost job.** The contention test
+  collected each thread's claims at the end, so a thread that died mid-round
+  took its record of successful claims with it, and the test reported job loss
+  the queue had not committed. CI on a 2-core runner found this; nothing on a
+  developer machine ever did.
 - **A blob pushed to `refs/heads/*` is rejected by git anyway** ("trying to
   write non-commit object to branch"). Testing the namespace guard with a job
   payload therefore proves nothing; `tests/test_hub_hook.py` builds a real
@@ -263,11 +274,13 @@ gitq/setup_repo.py  hub + worker stores, and the hub's pre-receive hook
 tests/test_gitq.py   15 assertions, real thread contention
 tests/test_bugs.py   8 regressions: cron atomicity, lease renewal, clock skew
 tests/harness.py     shared fixtures for the four suites
-tests/test_invariants.py  20 properties mutation testing proved were unchecked
+tests/test_invariants.py  23 properties mutation testing proved were unchecked
 tests/test_hub_hook.py    9 checks that the hub enforces its own namespace
 bench/bench.py       sharded vs unsharded
 bench/skew_probe.py  which guarantees survive a 5-minute clock skew
 tools/mutate.py      removes one guarantee at a time, checks a test notices
+tools/run_tests.py   runs all four suites, one process each, one verdict
+Dockerfile           the Linux test environment; pins a git that has reftable
 ```
 
 ## Mutation testing
@@ -278,7 +291,7 @@ fix -- and reports whether any test notices. A survivor names a behaviour
 nothing is checking.
 
 ```bash
-python3 tools/mutate.py            # 22 mutations, ~10 min
+python3 tools/mutate.py            # 24 mutations, ~11 min
 python3 tools/mutate.py --only no-cas
 ```
 
@@ -309,12 +322,38 @@ mutation has to forge a refspec past `RefTxn` to express the old bug at all.
 ```bash
 python3 tests/test_gitq.py       # 15 passed, 0 failed
 python3 tests/test_bugs.py       #  8 passed, 0 failed
-python3 tests/test_invariants.py # 20 passed, 0 failed
+python3 tests/test_invariants.py # 23 passed, 0 failed
 python3 tests/test_hub_hook.py   #  9 passed, 0 failed
-python3 tools/mutate.py          # 22 killed, 0 survived
+python3 tools/mutate.py          # 24 killed, 0 survived
 python3 bench/bench.py 8 200
 python3 bench/skew_probe.py
 ```
+
+Or all four suites at once, with one verdict:
+
+```bash
+python3 tools/run_tests.py
+```
+
+### On Linux
+
+Development here happens on macOS; CI and the Dockerfile are the check that
+nothing has quietly become macOS-specific. The image exists mostly to pin a
+git new enough for `reftable` -- `--ref-format=reftable` landed in 2.45, and
+distro gits are often older. The build fails outright if the base image ever
+drifts below that, rather than halfway through a suite.
+
+```bash
+docker build -t gitq-test .
+docker run --rm gitq-test                          # all four suites
+docker run --rm gitq-test python3 tools/mutate.py  # the full sweep, ~10 min
+```
+
+Verified on Alpine, git 2.54.0, Python 3.13, musl: 55 checks, 0 failed.
+
+CI runs exactly that image on every pull request, and the mutation sweep
+weekly -- it is too slow per-commit, and "a test stopped testing anything" is
+not a per-commit problem.
 
 ## Repo identity
 
@@ -347,3 +386,7 @@ default.
 
 Identity comes from `~/.gitconfig`'s conditional include for
 `~/github/stuffbucket/`; there is deliberately no local `user.*` here.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

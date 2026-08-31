@@ -123,6 +123,17 @@ MUTATIONS = [
      '    pass',
      "'..' survives into ref names, which git rejects"),
 
+    ("poll-dies-on-fetch-error", "gitq/queue.py",
+     "        except GitError:",
+     "        except ZeroDivisionError:",
+     "one failed fetch takes the whole worker down instead of degrading to "
+     "the mirror already on disk"),
+
+    ("worker-dies-on-error", "gitq/worker.py",
+     "                except GitError:",
+     "                except ZeroDivisionError:",
+     "the daemon loop stops surviving transient git failures"),
+
     ("shard-constant", "gitq/queue.py",
      '    return "s{:02d}".format(int.from_bytes(digest[:4], "big") % nshards)',
      '    return "s00"',
