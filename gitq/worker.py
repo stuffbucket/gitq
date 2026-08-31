@@ -6,6 +6,7 @@ import time
 import traceback
 
 from .cron import tick
+from .git import GitError
 from .queue import now_or
 from .reaper import Reaper
 from .shards import ShardLeases
@@ -33,7 +34,7 @@ class Worker:
         self._last_renew = 0.0
         self._cron_attempted = set()
         self.stats = {"claimed": 0, "done": 0, "failed": 0, "reclaimed": 0,
-                      "fired": 0, "lost": 0}
+                      "fired": 0, "lost": 0, "errors": 0}
 
     def _heartbeat(self, now=None, claim=None):
         """Refresh every lease this worker's liveness rests on.
@@ -129,9 +130,22 @@ class Worker:
             self.stats["done"] += 1
 
     def run(self, until=None):
+        """Poll until `until`. Survives transient git failures by design.
+
+        A worker is a daemon; git commands fail for reasons that have nothing
+        to do with this queue -- the hub momentarily locked, the machine out of
+        process slots. Dying on the first one and never coming back is worse
+        than any of them. Every operation is idempotent or a compare-and-swap,
+        so the correct response to an unexpected failure is the next poll.
+        """
         try:
             while until is None or time.time() < until:
-                if self.run_once() == 0:
+                try:
+                    worked = self.run_once()
+                except GitError:
+                    self.stats["errors"] += 1
+                    worked = 0
+                if worked == 0:
                     time.sleep(self.poll_s)
         except KeyboardInterrupt:
             pass

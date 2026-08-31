@@ -79,11 +79,18 @@ def test_no_loss_no_duplication():
 
         def go(i, q):
             got = []
-            for _ in range(6):
-                for s in q.shards():
-                    got += q.claim_batch(s, "w{}".format(i), limit=5, now=time.time())
-            with lock:
-                claims.extend(got)
+            try:
+                for _ in range(6):
+                    for s in q.shards():
+                        got += q.claim_batch(s, "w{}".format(i), limit=5,
+                                             now=time.time())
+            finally:
+                # Record the tally even if this thread dies. A job that was
+                # claimed and then dropped from the count is indistinguishable
+                # from a job the queue lost -- this test used to report the
+                # second when it was looking at the first.
+                with lock:
+                    claims.extend(got)
         parallel([lambda i=i, q=q: go(i, q) for i, q in enumerate(qs)])
         keys = [c["job"]["key"] for c in claims]
         left = qs[0].git.remote_refs("refs/jobs/q/*/pending/*")

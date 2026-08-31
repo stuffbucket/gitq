@@ -171,6 +171,44 @@ def test_every_ref_in_a_push_carries_a_lease():
         cleanup(d)
 
 
+def test_poll_survives_a_transient_fetch_failure():
+    """A worker must not die because one fetch failed. Stale mirror data is
+    safe to act on -- the claim is a compare-and-swap, so a stale oid costs a
+    rejected push, never a double run."""
+    d, (q,) = lab(1, nshards=1)
+    try:
+        q.enqueue("work", key="j1", due=1)
+        check("job is visible before the break", len(q.poll("s00", now=1000)) == 1)
+        q.git.run("remote", "set-url", "origin", str(d / "does-not-exist.git"))
+        try:
+            got = q.poll("s00", now=1000)
+            check("poll falls back to the mirror it already has", len(got) == 1,
+                  "got {} jobs from the stale mirror".format(len(got)))
+        except Exception as e:
+            check("poll falls back to the mirror it already has", False,
+                  "raised {}: {}".format(type(e).__name__, e))
+    finally:
+        cleanup(d)
+
+
+def test_worker_survives_a_transient_git_failure():
+    """`run` is a daemon loop. Dying on the first failed git command and never
+    coming back is worse than any failure it would be reporting."""
+    d, (q,) = lab(1, nshards=1)
+    try:
+        q.git.run("remote", "set-url", "origin", str(d / "does-not-exist.git"))
+        w = Worker(q, "w0", {}, poll_s=0.02)
+        try:
+            stats = w.run(until=time.time() + 0.4)
+            check("a broken remote is counted, not fatal", stats["errors"] > 0,
+                  "stats={}".format(stats))
+        except Exception as e:
+            check("a broken remote is counted, not fatal", False,
+                  "run() raised {}: {}".format(type(e).__name__, e))
+    finally:
+        cleanup(d)
+
+
 def test_a_long_job_keeps_its_shard_lease_alive():
     """_execute blocks the poll loop, so the shard lease has to be renewed from
     inside it. Otherwise a job outliving shard_lease_s silently hands this

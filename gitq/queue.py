@@ -13,7 +13,7 @@ import hashlib
 import re
 import time
 
-from .git import RefTxn
+from .git import GitError, RefTxn
 
 Q = "refs/jobs/q"
 DONE = "refs/jobs/done"
@@ -136,8 +136,19 @@ class Queue:
     def poll(self, shard, now=None):
         """Mirror a shard's pending refs locally and return due jobs, earliest first."""
         now = now_or(now)
-        mirrored = self.git.mirror_names("{}/{}/pending".format(Q, shard),
-                                         "{}/{}/pending".format(MIRROR, shard))
+        dst = "{}/{}/pending".format(MIRROR, shard)
+        try:
+            mirrored = self.git.mirror_names("{}/{}/pending".format(Q, shard), dst)
+        except GitError:
+            # A transient fetch failure -- the hub busy, or the machine out of
+            # process slots under load -- must not take a worker down. Fall back
+            # to the mirror already on disk. Acting on stale refs is safe here
+            # precisely because every claim is a compare-and-swap: a stale
+            # pending oid fails its lease, costing a rejected push and never a
+            # double run.
+            prefix = dst + "/"
+            mirrored = {ref[len(prefix):]: oid
+                        for ref, oid in self.git.local_refs(dst).items()}
         out = []
         for name, oid in mirrored.items():
             try:
