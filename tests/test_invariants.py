@@ -171,6 +171,73 @@ def test_every_ref_in_a_push_carries_a_lease():
         cleanup(d)
 
 
+def test_batch_read_skips_objects_this_store_lacks():
+    """`cat-file --batch` reports a bad oid on stdout and still exits 0. A
+    parser that assumes one payload per request walks off the end of the
+    stream and mis-frames every object after it."""
+    d, (q,) = lab()
+    try:
+        good = q.git.write_blob("hello")
+        absent = "0" * 40
+        try:
+            # Mis-framing raises rather than returning wrong bytes, so catch it
+            # here: a crashed suite names no property, and this one has a name.
+            got = q.git.read_blobs([absent, good, absent])
+        except Exception as exc:                        # noqa: BLE001
+            got = {"raised": "{}: {}".format(type(exc).__name__, exc)}
+        check("a missing object is skipped, not guessed at",
+              set(got) == {good} and got.get(good) == b"hello",
+              "got {!r}".format(got))
+    finally:
+        cleanup(d)
+
+
+def test_batch_read_frames_payloads_exactly():
+    """The header's size counts bytes and excludes the trailing newline. Off by
+    one and every object after it in the batch comes back corrupt -- which is
+    why this uses payloads that are empty, multi-line, and multi-byte."""
+    d, (q,) = lab()
+    try:
+        payloads = [b"", b"x", b"line\nline\n",
+                    "\u00e9\u4e2d".encode() * 2000, b"trailing\n"]
+        oids = q.git.write_blobs(payloads)
+        got = q.git.read_blobs(oids)
+        bad = [i for i, (o, want) in enumerate(zip(oids, payloads))
+               if got.get(o) != want]
+        check("batch write returns one oid per payload, in order",
+              len(oids) == len(payloads))
+        check("every payload survives a batch read intact", not bad,
+              "payload(s) {} came back wrong".format(bad))
+    finally:
+        cleanup(d)
+
+
+def test_one_fetch_prunes_every_shard_it_names():
+    """Mirroring many shards in one fetch is only safe if --prune still covers
+    each refspec's destination. A shard that stops being pruned keeps pending
+    refs for jobs someone else already claimed -- jobs that look claimable and
+    can never be claimed."""
+    d, (q,) = lab(1, nshards=4)
+    try:
+        for i in range(12):
+            q.enqueue("work", key="j{}".format(i), due=1)
+        shards = q.shards()
+        polled = q.poll_many(shards, now=1000)
+        check("one fetch mirrors every shard",
+              sum(len(v) for v in polled.values()) == 12,
+              "saw {}".format(sum(len(v) for v in polled.values())))
+
+        # Claiming deletes every pending ref on the hub. The mirrors still hold
+        # them until the next fetch prunes -- which is the thing under test.
+        for shard in shards:
+            q.claim_batch(shard, "w0", limit=50, now=1000, due=polled[shard])
+        left = sum(len(v) for v in q.poll_many(shards, now=1000).values())
+        check("and prunes every shard it names", left == 0,
+              "{} stale pending refs survived the combined fetch".format(left))
+    finally:
+        cleanup(d)
+
+
 def test_poll_survives_a_transient_fetch_failure():
     """A worker must not die because one fetch failed. Stale mirror data is
     safe to act on -- the claim is a compare-and-swap, so a stale oid costs a

@@ -123,6 +123,18 @@ MUTATIONS = [
      '    pass',
      "'..' survives into ref names, which git rejects"),
 
+    ("batch-read-ignores-missing", "gitq/git.py",
+     '            if header[-1] in (b"missing", b"ambiguous"):',
+     "            if False:",
+     "a missing object stops being skipped, mis-framing every object after it"),
+
+    ("combined-fetch-no-prune", "gitq/git.py",
+     '        self.run("fetch", "--prune", "--quiet", "--no-tags",\n'
+     '                 "--no-write-fetch-head", "origin", *specs)',
+     '        self.run("fetch", "--quiet", "--no-tags",\n'
+     '                 "--no-write-fetch-head", "origin", *specs)',
+     "combined mirroring stops pruning, so claimed jobs linger as pending"),
+
     ("poll-dies-on-fetch-error", "gitq/queue.py",
      "        except GitError:",
      "        except ZeroDivisionError:",
@@ -219,6 +231,16 @@ def main():
         print("\nverifying source restored: ", end="", flush=True)
         ok, _ = run_suites()
         print("green" if ok else "DIRTY -- RESTORE FAILED")
+        if not ok:
+            # Every mutation is written into the tree and then written back
+            # out. If that restore ever failed -- a full disk is the plausible
+            # way -- the run continued against a broken tree, and every
+            # mutation after that point "died" instantly without being tested.
+            # The totals above are then not evidence of anything, so this must
+            # not exit 0: a green CI run on a corrupted sweep is worse than no
+            # sweep at all.
+            print("counts above are void: the tree was broken mid-run")
+            return 2
         return 0 if survived == 0 else 1
     finally:
         pass
